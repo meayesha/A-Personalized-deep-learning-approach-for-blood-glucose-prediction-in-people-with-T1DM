@@ -11,7 +11,8 @@
 #     OR python preprocess.py get_windowed_data
 #     OR python preprocess.py all (runs all the functions sequentially)
 
-# Author = Hadia Hameed
+# Original Code: from HAIL Lab (2020) by Hadia Hameed
+# Reused for data cleaning and preprocessing of the OAPS dataset.
 # Refrences = https://machinelearningmastery.com/multivariate-time-series-forecasting-lstms-keras/
 # ---------------------------------------------------------------
 

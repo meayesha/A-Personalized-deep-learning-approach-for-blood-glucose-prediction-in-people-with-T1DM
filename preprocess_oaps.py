@@ -7,7 +7,8 @@
 # - combine data from multiple files and save it as a single file 
 #   for each subject (create multi-modality data)
 
-# Author: Hadia Hameed
+# Original Code: from HAIL Lab (2020) by Hadia Hameed
+# Reused for data cleaning and preprocessing of the OAPS dataset.
 # References:
 # https://machinelearningmastery.com/arima-for-time-series-forecasting-with-python/
 # https://www.tutorialspoint.com/python_pandas/python_pandas_groupby.htm

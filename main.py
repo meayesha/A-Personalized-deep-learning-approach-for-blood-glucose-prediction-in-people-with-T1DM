@@ -21,7 +21,9 @@
 # train an RNN model on OhioT1DM data instead of the actual
 # ground truth.
 
-# Author: Hadia Hameed
+# Original Code: from HAIL Lab (2020) by Hadia Hameed
+# Referenced for incremental_lstm model.
+# Modified by Ayesha Parveen (2021)
 # References:
 # https://machinelearningmastery.com/arima-for-time-series-forecasting-with-python/
 # https://machinelearningmastery.com/multivariate-time-series-forecasting-lstms-keras/
