@@ -33,6 +33,14 @@ from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
 # -------------------------
 # Global defaults (will be set by CLI)
 # -------------------------
@@ -115,16 +123,134 @@ def build_model(history_window, n_features, out_dim=1, units=STATE_VECTOR_LENGTH
     model.compile(optimizer=Adam(learning_rate=lr), loss='mse', metrics=['mse'])
     return model
 
+def find_windowed_pickle(data_dir, split_name, substring):
+    """
+    Locate windowed pickle files from either main.py or preprocess_ohio.py layouts.
+    """
+    candidates = [
+        os.path.join(data_dir, split_name, 'imputed', f'windowed_{substring}.pickle'),
+        os.path.join(data_dir, 'csv_files', split_name, 'imputed', f'windowed_{substring}.pickle'),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+def load_subject_data(data_dir, pred_window, normalize):
+    ph = str(pred_window)
+    substring = ('normalized_' if normalize else '') + ph + 'min'
+    pickles = {}
+    for split in ('OhioT1DM-training', 'OhioT1DM-testing'):
+        path = find_windowed_pickle(data_dir, split, substring)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                "Expected preprocessed pickle not found. Run preprocess_ohio.py first.\n"
+                f"Tried: {path}"
+            )
+        with open(path, 'rb') as f:
+            pickles[split] = pickle.load(f, encoding='latin1')
+
+    all_subjects = {}
+    all_subjects.update(pickles['OhioT1DM-training'])
+    all_subjects.update(pickles['OhioT1DM-testing'])
+    return all_subjects
+
+def concat_subject_arrays(subject_data, subject_ids):
+    all_X = None
+    all_y = None
+    for sid in subject_ids:
+        X_sub, y_sub, _ = process_data(subject_data[sid])
+        if X_sub.shape[0] == 0:
+            continue
+        if all_X is None:
+            all_X = X_sub
+            all_y = y_sub
+        else:
+            all_X = np.concatenate((all_X, X_sub), axis=0)
+            all_y = np.concatenate((all_y, y_sub), axis=0)
+    return all_X, all_y
+
+def train_base_model(X, y, history_window, n_features, initial_epochs, batch, lr):
+    X = shape_X_for_lstm(X, history_window, n_features)
+    y = np.array(y).reshape((-1, 1))
+    model = build_model(history_window, n_features, out_dim=1, units=STATE_VECTOR_LENGTH, lr=lr)
+
+    num_train = X.shape[0]
+    val_frac = 0.05
+    if num_train > 50:
+        split = int(num_train * (1.0 - val_frac))
+        es = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=0)
+        model.fit(
+            X[:split], y[:split],
+            validation_data=(X[split:], y[split:]),
+            epochs=initial_epochs,
+            batch_size=batch,
+            callbacks=[es],
+            verbose=0,
+        )
+    else:
+        model.fit(X, y, epochs=initial_epochs, batch_size=batch, verbose=0)
+    return model
+
+def summarize_subject_results(results):
+    rows = []
+    for subj, res in sorted(results.items()):
+        per_day = res.get('per_day_rmse') or []
+        avg = res.get('mean_rmse')
+        best = res.get('best_rmse')
+        worst = res.get('worst_rmse')
+        if avg is None and per_day:
+            avg = float(np.mean(per_day))
+        if best is None and per_day:
+            best = float(np.min(per_day))
+        if worst is None and per_day:
+            worst = float(np.max(per_day))
+        rows.append({
+            'Subject': subj,
+            'Average': avg,
+            'Best': best,
+            'Worst': worst,
+            'Days': len(per_day),
+        })
+    return pd.DataFrame(rows)
+
+def print_results_table(title, results):
+    df = summarize_subject_results(results)
+    print(f"\n{title}")
+    print(df.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+    if df['Average'].notna().any():
+        print(f"Overall mean RMSE: {df['Average'].mean():.3f}")
+
+def plot_per_day_rmse(results, output_dir, experiment_name):
+    if not HAS_MPL:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    for subj, res in sorted(results.items()):
+        per_day = res.get('per_day_rmse') or []
+        if not per_day:
+            continue
+        plt.figure(figsize=(10, 4))
+        plt.plot(range(1, len(per_day) + 1), per_day, marker='o', markersize=3)
+        plt.xlabel('Day')
+        plt.ylabel('RMSE (mg/dL)')
+        plt.title(f'{experiment_name} — Subject P{subj}')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{experiment_name}_P{subj}.png'))
+        plt.close()
+
 # -------------------------
 # Evaluation functions
 # -------------------------
-def evaluate_vanilla(model, test_data, history_window, n_features, model_out=None, verbose=0):
+def evaluate_vanilla(model, test_data, history_window, n_features, model_out=None, verbose=0, subject_ids=None):
     """
     Evaluate vanilla (non-incremental) model: batch predict per-day and compute per-day RMSEs.
     test_data: dict mapping subject_id -> subject_dataframe
     """
     results = {}
-    for subj, subj_df in test_data.items():
+    subjects = subject_ids if subject_ids is not None else test_data.keys()
+    for subj in subjects:
+        subj_df = test_data[subj]
         X_all, y_all, dates = process_data(subj_df)
         if X_all.shape[0] == 0:
             results[subj] = {'per_day_rmse': [], 'mean_rmse': None, 'days_count': 0}
@@ -163,14 +289,16 @@ def evaluate_vanilla(model, test_data, history_window, n_features, model_out=Non
 
     return results
 
-def evaluate_incremental(model, test_data, history_window, n_features, incremental_epochs=3, inc_lr=1e-4, model_out=None, verbose=0, lr_main=1e-3):
+def evaluate_incremental(model, test_data, history_window, n_features, incremental_epochs=3, inc_lr=1e-4, model_out=None, verbose=0, lr_main=1e-3, subject_ids=None):
     """
     Evaluate incremental model: predict sample-by-sample for each day, compute day RMSE,
     then fine-tune model on that day's true examples.
     The model is updated in-place.
     """
     results = {}
-    for subj, subj_df in test_data.items():
+    subjects = subject_ids if subject_ids is not None else test_data.keys()
+    for subj in subjects:
+        subj_df = test_data[subj]
         print(f"[incremental] processing subject {subj} ...")
         X_all, y_all, dates = process_data(subj_df)
         if X_all.shape[0] == 0:
@@ -231,12 +359,86 @@ def evaluate_incremental(model, test_data, history_window, n_features, increment
 
     return results
 
+def run_vanilla_with_repeats(subject_data, test_subj, history_window, n_features, train_ids,
+                           initial_epochs, batch, lr, vanilla_runs, model_out=None):
+    """
+    Thesis baseline: retrain a fresh model vanilla_runs times on n-1 subjects,
+    then evaluate on the held-out subject without any online updates.
+    """
+    per_run_means = []
+    per_run_best = []
+    per_run_worst = []
+    per_run_days = []
+
+    for run_idx in range(vanilla_runs):
+        base_model = train_base_model(
+            *concat_subject_arrays(subject_data, train_ids),
+            history_window, n_features, initial_epochs, batch, lr,
+        )
+        vanilla_model = build_model(history_window, n_features, out_dim=1, units=STATE_VECTOR_LENGTH, lr=lr)
+        vanilla_model.set_weights(base_model.get_weights())
+        run_result = evaluate_vanilla(
+            vanilla_model,
+            subject_data,
+            history_window,
+            n_features,
+            model_out=model_out if run_idx == vanilla_runs - 1 else None,
+            subject_ids=[test_subj],
+        )
+        res = run_result[test_subj]
+        per_day = res['per_day_rmse']
+        per_run_means.append(res['mean_rmse'])
+        per_run_best.append(float(np.min(per_day)))
+        per_run_worst.append(float(np.max(per_day)))
+        per_run_days.append(per_day)
+
+    return {
+        test_subj: {
+            'per_day_rmse': per_run_days[-1],
+            'mean_rmse': float(np.mean(per_run_means)),
+            'best_rmse': float(np.min(per_run_best)),
+            'worst_rmse': float(np.max(per_run_worst)),
+            'days_count': len(per_run_days[-1]),
+            'run_means': per_run_means,
+        }
+    }
+
+def run_incremental_for_subject(subject_data, test_subj, history_window, n_features, train_ids,
+                                initial_epochs, batch, lr, inc_epochs, inc_lr, model_out=None):
+    base_model = train_base_model(
+        *concat_subject_arrays(subject_data, train_ids),
+        history_window, n_features, initial_epochs, batch, lr,
+    )
+    inc_model = build_model(history_window, n_features, out_dim=1, units=STATE_VECTOR_LENGTH, lr=lr)
+    inc_model.set_weights(base_model.get_weights())
+    result = evaluate_incremental(
+        inc_model,
+        subject_data,
+        history_window,
+        n_features,
+        incremental_epochs=inc_epochs,
+        inc_lr=inc_lr,
+        model_out=model_out,
+        lr_main=lr,
+        subject_ids=[test_subj],
+    )
+    per_day = result[test_subj]['per_day_rmse']
+    result[test_subj]['best_rmse'] = float(np.min(per_day)) if per_day else None
+    result[test_subj]['worst_rmse'] = float(np.max(per_day)) if per_day else None
+    return result
+
 # -------------------------
 # CLI / main
 # -------------------------
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Incremental LSTM (self-contained using your process_data) for univariate CGM")
-    parser.add_argument('--data_dir', type=str, default='/mnt/data', help='root data dir (contains OhioT1DM-training/imputed and OhioT1DM-testing/imputed)')
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    default_data_dir = os.path.join(repo_root, 'data')
+
+    parser = argparse.ArgumentParser(
+        description="Incremental LSTM for univariate CGM (thesis-aligned leave-one-subject-out evaluation)"
+    )
+    parser.add_argument('--data_dir', type=str, default=default_data_dir,
+                        help='root data dir containing OhioT1DM XML/pickles')
     parser.add_argument('--history', type=int, default=12, help='history window length (timesteps)')
     parser.add_argument('--pred_window', type=int, default=30, help='prediction horizon in minutes')
     parser.add_argument('--initial_epochs', type=int, default=20)
@@ -244,14 +446,23 @@ if __name__ == '__main__':
     parser.add_argument('--batch', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--inc_lr', type=float, default=1e-4)
-    parser.add_argument('--normalize', action='store_true', help='if your pickles are named windowed_normalized_30min.pickle')
-    parser.add_argument('--models_inc_out', type=str, default='./models_incremental', help='where to save incremental models')
-    parser.add_argument('--models_vanilla_out', type=str, default='./models_vanilla', help='where to save vanilla models')
+    parser.add_argument('--vanilla_runs', type=int, default=5,
+                        help='number of training repeats for vanilla baseline (thesis uses 5)')
+    parser.add_argument('--subjects', type=str, default='',
+                        help='comma-separated subject IDs to run (default: all 12)')
+    parser.add_argument('--pooled', action='store_true',
+                        help='use original pooled train/test split instead of leave-one-subject-out')
+    parser.add_argument('--normalize', action='store_true',
+                        help='if your pickles are named windowed_normalized_30min.pickle')
+    parser.add_argument('--plot', action='store_true', help='save per-day RMSE curves as PNG files')
+    parser.add_argument('--models_inc_out', type=str, default='./models_incremental')
+    parser.add_argument('--models_vanilla_out', type=str, default='./models_vanilla')
+    parser.add_argument('--results_dir', type=str, default='./results_incremental')
     args = parser.parse_args()
 
-    # set globals used by process_data
     prediction_window = args.pred_window
-    # keep original names for process_data usage
+    if prediction_window in (30, 60):
+        prediction_window = prediction_window // 5
     prediction_type = 'single'
     dimension = 'univariate'
 
@@ -263,85 +474,85 @@ if __name__ == '__main__':
     BATCH = args.batch
     LR = args.lr
     INC_LR = args.inc_lr
-
-    # locate pickles produced by preprocess (windowed_*min.pickle)
-    ph = str(PRED_WINDOW)
-    substring = ('normalized_' if args.normalize else '') + ph + 'min'
-    train_pickle = os.path.join(DATA_DIR, 'OhioT1DM-training', 'imputed', f'windowed_{substring}.pickle')
-    test_pickle  = os.path.join(DATA_DIR, 'OhioT1DM-testing', 'imputed', f'windowed_{substring}.pickle')
-
-    if not os.path.isfile(train_pickle) or not os.path.isfile(test_pickle):
-        raise FileNotFoundError(f"Expected pickles not found. Check paths:\n{train_pickle}\n{test_pickle}")
-
-    with open(train_pickle, 'rb') as f:
-        train_data = pickle.load(f, encoding='latin1')
-    with open(test_pickle, 'rb') as f:
-        test_data = pickle.load(f, encoding='latin1')
-
-    # pooled training dataset
-    all_train_X = None; all_train_y = None
-    for sid, subj_df in train_data.items():
-        X_sub, y_sub, _ = process_data(subj_df)
-        if X_sub.shape[0] == 0:
-            continue
-        if all_train_X is None:
-            all_train_X = X_sub; all_train_y = y_sub
-        else:
-            all_train_X = np.concatenate((all_train_X, X_sub), axis=0)
-            all_train_y = np.concatenate((all_train_y, y_sub), axis=0)
-
-    if all_train_X is None or all_train_X.shape[0] == 0:
-        raise RuntimeError("No training samples extracted from train pickles. Check preprocess outputs and process_data assumptions.")
-
-    # Ensure shapes for LSTM
     N_FEATURES = 1
-    all_train_X = shape_X_for_lstm(all_train_X, HISTORY, N_FEATURES)
-    all_train_y = np.array(all_train_y).reshape((-1, 1))
 
-    print("Building base LSTM model and training on pooled training subjects ...")
-    base_model = build_model(HISTORY, N_FEATURES, out_dim=1, units=STATE_VECTOR_LENGTH, lr=LR)
+    subject_data = load_subject_data(DATA_DIR, PRED_WINDOW, args.normalize)
+    all_subjects = sorted(subject_data.keys())
+    if args.subjects.strip():
+        selected = [s.strip() for s in args.subjects.split(',') if s.strip()]
+        missing = [s for s in selected if s not in subject_data]
+        if missing:
+            raise ValueError(f"Unknown subject IDs: {missing}")
+        all_subjects = selected
 
-    # small validation split from pooled data (5%) if enough samples
-    num_train = all_train_X.shape[0]
-    val_frac = 0.05
-    if num_train > 50:
-        split = int(num_train * (1.0 - val_frac))
-        X_tr = all_train_X[:split]; y_tr = all_train_y[:split]
-        X_val = all_train_X[split:]; y_val = all_train_y[split:]
-        es = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=0)
-        base_model.fit(X_tr, y_tr, validation_data=(X_val, y_val), epochs=INITIAL_EPOCHS, batch_size=BATCH, callbacks=[es], verbose=1)
+    print(f"Loaded {len(all_subjects)} subjects: {', '.join(all_subjects)}")
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    vanilla_results = {}
+    incremental_results = {}
+
+    if args.pooled:
+        train_ids = [s for s in all_subjects if s in ('559', '563', '570', '575', '588', '591')]
+        test_ids = [s for s in all_subjects if s not in train_ids]
+        if not train_ids or not test_ids:
+            raise RuntimeError("Pooled mode expects standard Ohio split (6 train + 6 test subjects).")
+
+        print("\n=== Pooled mode: train on OhioT1DM-training subjects, test on OhioT1DM-testing subjects ===")
+        base_model = train_base_model(
+            *concat_subject_arrays(subject_data, train_ids),
+            HISTORY, N_FEATURES, INITIAL_EPOCHS, BATCH, LR,
+        )
+        vanilla_model = build_model(HISTORY, N_FEATURES, out_dim=1, units=STATE_VECTOR_LENGTH, lr=LR)
+        vanilla_model.set_weights(base_model.get_weights())
+        vanilla_results = evaluate_vanilla(
+            vanilla_model, subject_data, HISTORY, N_FEATURES,
+            model_out=args.models_vanilla_out, subject_ids=test_ids,
+        )
+        inc_model = build_model(HISTORY, N_FEATURES, out_dim=1, units=STATE_VECTOR_LENGTH, lr=LR)
+        inc_model.set_weights(base_model.get_weights())
+        incremental_results = evaluate_incremental(
+            inc_model, subject_data, HISTORY, N_FEATURES,
+            incremental_epochs=INC_EPOCHS, inc_lr=INC_LR,
+            model_out=args.models_inc_out, lr_main=LR, subject_ids=test_ids,
+        )
     else:
-        base_model.fit(all_train_X, all_train_y, epochs=INITIAL_EPOCHS, batch_size=BATCH, verbose=1)
+        print("\n=== Leave-one-subject-out mode (thesis setup) ===")
+        for test_subj in all_subjects:
+            train_ids = [s for s in all_subjects if s != test_subj]
+            print(f"\n--- Held-out subject P{test_subj} | train on {len(train_ids)} subjects ---")
 
-    # Experiment 1: Vanilla
-    print("\n=== Running vanilla (non-incremental) evaluation ===")
-    vanilla_model = build_model(HISTORY, N_FEATURES, out_dim=1, units=STATE_VECTOR_LENGTH, lr=LR)
-    vanilla_model.set_weights(base_model.get_weights())
-    vanilla_results = evaluate_vanilla(vanilla_model, test_data, HISTORY, N_FEATURES, model_out=args.models_vanilla_out, verbose=0)
+            vanilla_results.update(
+                run_vanilla_with_repeats(
+                    subject_data, test_subj, HISTORY, N_FEATURES, train_ids,
+                    INITIAL_EPOCHS, BATCH, LR, args.vanilla_runs,
+                    model_out=args.models_vanilla_out,
+                )
+            )
+            incremental_results.update(
+                run_incremental_for_subject(
+                    subject_data, test_subj, HISTORY, N_FEATURES, train_ids,
+                    INITIAL_EPOCHS, BATCH, LR, INC_EPOCHS, INC_LR,
+                    model_out=args.models_inc_out,
+                )
+            )
 
-    # Experiment 2: Incremental
-    print("\n=== Running incremental evaluation (predict -> update per day) ===")
-    inc_model = build_model(HISTORY, N_FEATURES, out_dim=1, units=STATE_VECTOR_LENGTH, lr=LR)
-    inc_model.set_weights(base_model.get_weights())
-    incremental_results = evaluate_incremental(inc_model, test_data, HISTORY, N_FEATURES, incremental_epochs=INC_EPOCHS, inc_lr=INC_LR, model_out=args.models_inc_out, verbose=0, lr_main=LR)
-
-    # Save summary (both experiments)
     summary = {'vanilla': vanilla_results, 'incremental': incremental_results}
-    outpath = os.path.join('.', 'incremental_lstm_summary.pickle')
+    outpath = os.path.join(args.results_dir, 'incremental_lstm_summary.pickle')
     with open(outpath, 'wb') as f:
         pickle.dump(summary, f)
     print(f"\nSaved summary to {outpath}")
 
-    # Print brief overall numbers
-    def overall_mean(results):
-        all_vals = []
-        for subj_res in results.values():
-            all_vals.extend(subj_res['per_day_rmse'])
-        return float(np.mean(all_vals)) if all_vals else None
+    print_results_table('Table 4.1 style — Vanilla (non-incremental) RMSE by subject', vanilla_results)
+    print_results_table('Table 4.2 style — Incremental RMSE by subject', incremental_results)
 
-    vmean = overall_mean(vanilla_results)
-    imean = overall_mean(incremental_results)
-    if vmean is not None:
-        print(f"Vanilla overall mean RMSE: {vmean:.3f}")
-    if imean is not None:
-        print(f"Incremental overall mean RMSE: {imean:.3f}")
+    vanilla_csv = os.path.join(args.results_dir, 'vanilla_subject_rmse.csv')
+    incremental_csv = os.path.join(args.results_dir, 'incremental_subject_rmse.csv')
+    summarize_subject_results(vanilla_results).to_csv(vanilla_csv, index=False)
+    summarize_subject_results(incremental_results).to_csv(incremental_csv, index=False)
+    print(f"Saved CSV summaries to {vanilla_csv} and {incremental_csv}")
+
+    if args.plot:
+        plot_dir = os.path.join(args.results_dir, 'plots')
+        plot_per_day_rmse(vanilla_results, os.path.join(plot_dir, 'vanilla'), 'Vanilla')
+        plot_per_day_rmse(incremental_results, os.path.join(plot_dir, 'incremental'), 'Incremental')
+        print(f"Saved per-day RMSE plots under {plot_dir}")

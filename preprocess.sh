@@ -1,13 +1,11 @@
 #!/bin/sh
 dataset='ohio' #ohio or oaps
-if [ "$dataset" = "ohio" ]; then
-    root_directory="../../../../PHI/PHI_OHIO/" 
-    data_directory=$root_directory"data/"
-fi
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root_directory="$SCRIPT_DIR/"
+data_directory="$SCRIPT_DIR/data/"
 if [ "$dataset" = "oaps" ]; then
     root_directory="../../../../PHI/PHI_OAPS/" 
-    data_directory=$root_directory"OpenAPS_data/n=88_OpenAPSDataAugust242018/" #../../../data/PHI/PHI_OAPS/OpenAPS_data/n=88_OpenAPSDataAugust242018/
-
+    data_directory=$root_directory"OpenAPS_data/n=88_OpenAPSDataAugust242018/"
 fi
 filter_data=True
 normalize_data=False
