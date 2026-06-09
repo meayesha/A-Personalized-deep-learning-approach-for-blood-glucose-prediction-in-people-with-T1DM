@@ -189,8 +189,8 @@ You need pre-trained teacher weights under `model_directory` for teacher-based p
 ## References
 
 - Thesis: *A Personalized Deep Learning Approach for Blood Glucose Prediction in People with T1DM* — Ayesha Parveen (2021), Stevens Institute of Technology
-- Original HAIL Lab code: Hadia Hameed (2020)
-- OhioT1DM dataset: [sleepbench/OhioT1DM](https://github.com/jxx123/sleepbench)
+- Original HAIL Lab code for data preprocessing: Hadia Hameed (2020)
+- OhioT1DM dataset
 
 ## Citation
 
